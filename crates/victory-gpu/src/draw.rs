@@ -451,6 +451,110 @@ fn catching_up(more: std::time::Duration) -> bool {
     SPENT.fetch_add(more, Ordering::Relaxed) + more < total
 }
 
+/// The time a frame gives the passes over textures picked by index
+/// ([`State::heap_textures`]), as a share of the rest of the frame.
+/// The passes run on a thread that records the frame, so their fixed spans
+/// (250 ms, and 1.5 s while catching up) went straight into the frame
+/// time: on an RX 7900 XTX the world's slowest frames took 1-2.4 s, of
+/// which the passes 0.75-2.2 s. Each frame now gets at most
+/// `VICTORY_TEXTURE_SHARE` percent (35) of what the rest of recent frames
+/// took, twice that while more than 2,000 slots wait. At least 8 ms, and
+/// never more than the fixed spans. 0 keeps the fixed spans alone.
+/// The rest is measured without the passes' own time, so a slow pass does
+/// not raise the next frame's allowance.
+mod texture_time {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::{Duration, Instant};
+
+    /// Microseconds the passes have taken this frame.
+    static SPENT_US: AtomicU64 = AtomicU64::new(0);
+    /// When this frame's first pass ran (microseconds since `EPOCH`; 0: none yet).
+    static BEGAN_US: AtomicU64 = AtomicU64::new(0);
+    /// The rest of recent frames, the passes not counted: a moving
+    /// average in microseconds (0: not measured yet).
+    static REST_US: AtomicU64 = AtomicU64::new(0);
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    /// The least a frame gets, so that the queue always moves.
+    const FLOOR_US: u64 = 8_000;
+
+    fn now_us() -> u64 {
+        EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64
+    }
+
+    fn share() -> u64 {
+        static SHARE: OnceLock<u64> = OnceLock::new();
+        *SHARE.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_SHARE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(35)
+        })
+    }
+
+    /// At a new frame's first pass: the last frame's rest goes into the average.
+    pub(super) fn next_frame() {
+        let now = now_us().max(1);
+        let began = BEGAN_US.swap(now, Relaxed);
+        let spent = SPENT_US.swap(0, Relaxed);
+        if began == 0 {
+            return;
+        }
+        let rest = now.saturating_sub(began).saturating_sub(spent);
+        let old = REST_US.load(Relaxed);
+        REST_US.store(if old == 0 { rest } else { (old * 3 + rest) / 4 }, Relaxed);
+    }
+
+    /// What this pass may take: what is left of the frame's share, within
+    /// `fixed` (the span it had before).
+    pub(super) fn span(fixed: Duration, long_queue: bool) -> Duration {
+        let share = share();
+        let rest = REST_US.load(Relaxed);
+        if share == 0 || rest == 0 {
+            return fixed;
+        }
+        let share = if long_queue { (share * 2).min(100) } else { share };
+        let frame = (rest * share / 100).max(FLOOR_US);
+        let left = frame.saturating_sub(SPENT_US.load(Relaxed));
+        fixed.min(Duration::from_micros(left))
+    }
+
+    /// Counts a pass's time against its frame when the pass ends.
+    pub(super) struct Charge(pub(super) Instant);
+
+    impl Drop for Charge {
+        fn drop(&mut self) {
+            SPENT_US.fetch_add(self.0.elapsed().as_micros() as u64, Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_share_follows_the_rest_of_the_frame_and_stays_within_the_fixed_span() {
+            let fixed = Duration::from_millis(250);
+            // Not measured yet: the fixed span.
+            REST_US.store(0, Relaxed);
+            assert_eq!(span(fixed, false), fixed);
+            // 200 ms of rest: 35 % is 70 ms; twice that with a long queue.
+            REST_US.store(200_000, Relaxed);
+            SPENT_US.store(0, Relaxed);
+            assert_eq!(span(fixed, false), Duration::from_millis(70));
+            assert_eq!(span(fixed, true), Duration::from_millis(140));
+            // What the frame's passes have taken already is taken off.
+            SPENT_US.store(50_000, Relaxed);
+            assert_eq!(span(fixed, false), Duration::from_millis(20));
+            // A long rest is held to the fixed span.
+            REST_US.store(10_000_000, Relaxed);
+            SPENT_US.store(0, Relaxed);
+            assert_eq!(span(fixed, false), fixed);
+            // A short one still gets the floor.
+            REST_US.store(1_000, Relaxed);
+            assert_eq!(span(fixed, false), Duration::from_micros(FLOOR_US));
+            REST_US.store(0, Relaxed);
+        }
+    }
+}
+
 /// Buffer views of the heap whose slot showed another host buffer than
 /// the copy the pass brought up to date for them, since the start
 /// (diagnostics; for the memory line). It stays 0 while the pass and the
@@ -1890,6 +1994,7 @@ impl State {
         let frame = crate::frame::current();
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
+            texture_time::next_frame();
         }
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
@@ -1982,9 +2087,10 @@ impl State {
             Some((ms, bytes)) => {
                 (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
             }
-            None => (span, per_frame),
+            None => (texture_time::span(span, census[0] > LONG), per_frame),
         };
         let began = std::time::Instant::now();
+        let _spent = texture_time::Charge(began);
         for (index, write, recovered) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
